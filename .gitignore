@@ -1,0 +1,14 @@
+# Virtual environment
+venv/
+
+# Compiled Python files
+__pycache__/
+*.pyc
+
+# YOLO model weights
+models/
+*.pt
+
+# Image outputs
+images/
+
