@@ -1,8 +1,0 @@
-paho-mqtt
-picamera2
-torch
-Pillow
-numpy
-ultralytics
-RPi.GPIO
-opencv-python
