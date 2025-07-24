@@ -1,143 +1,151 @@
-# servo.py (Versi Modifikasi dengan kategori 'others')
-import paho.mqtt.client as mqtt
 import RPi.GPIO as GPIO
+import paho.mqtt.client as mqtt
 import time
 
-# --- Konfigurasi ---
+SORTER_SERVO_PIN = 18
+GATE_SERVO_PIN = 23
+
+
 MQTT_BROKER = "broker.emqx.io"
 MQTT_PORT = 1883
-MQTT_TOPIC_SUB = "waste/raw"
+MQTT_TOPIC = "waste/raw"
 
-# GPIO Pins
-SERVO_PUSHER_PIN = 27
-SERVO_SORTER_PIN = 17
 
-# Frekuensi Servo
-SERVO_FREQ = 50
+pwm_sorter = None
+pwm_gate = None
+current_sorter_angle = 0
 
-# ===================================================================
-# --- SESUAIKAN SUDUT SERVO ANDA DI SINI ---
-# ===================================================================
-SERVO_POSITIONS = {
-    "plastic": 20,   # <-- Ganti sudut untuk plastik
-    "paper": 95,     # <-- Ganti sudut untuk kertas
-    "organic": 150,  # <-- Ganti sudut untuk organik
-    "others": 60     # <-- Ganti sudut untuk kategori 'lainnya'
-}
-# ===================================================================
+# --- Inisialisasi Servo ---
+def setup_servos():
+    global pwm_sorter, pwm_gate, current_sorter_angle
+    
+    GPIO.setmode(GPIO.BCM)
+    GPIO.setup(SORTER_SERVO_PIN, GPIO.OUT)
+    GPIO.setup(GATE_SERVO_PIN, GPIO.OUT)
+    
+    # Frekuensi PWM 50Hz
+    pwm_sorter = GPIO.PWM(SORTER_SERVO_PIN, 50)
+    pwm_gate = GPIO.PWM(GATE_SERVO_PIN, 50)
+    
+    pwm_sorter.start(0)
+    pwm_gate.start(0)
+    
+    print("Kedua servo telah diinisialisasi.")
+    
+    # Atur posisi awal saat program dimulai
+    # Servo penyortir di 0 derajat, servo penahan di posisi menutup (0 derajat)
+    move_servo(pwm_gate, 0) # Pastikan gate tertutup
+    time.sleep(0.5)
+    current_sorter_angle = smooth_move(pwm_sorter, current_sorter_angle, 0) # Sorter di posisi awal
+    print("Servo siap di posisi awal.")
 
-# Posisi Sudut Servo Pendorong
-PUSHER_HOME_POS = 0
-PUSHER_PUSH_POS = 90
-
-# --- Inisialisasi GPIO ---
-GPIO.setmode(GPIO.BCM)
-GPIO.setup(SERVO_PUSHER_PIN, GPIO.OUT)
-GPIO.setup(SERVO_SORTER_PIN, GPIO.OUT)
-
-pusher_pwm = GPIO.PWM(SERVO_PUSHER_PIN, SERVO_FREQ)
-sorter_pwm = GPIO.PWM(SERVO_SORTER_PIN, SERVO_FREQ)
-
-pusher_pwm.start(0)
-sorter_pwm.start(0)
-
-# --- Fungsi Helper Servo ---
 def angle_to_duty_cycle(angle):
-    return 2 + (angle / 180) * 10
+    """Mengonversi sudut (0-180) ke duty cycle (2-12)."""
+    return (angle / 18) + 2
 
 def move_servo(pwm, angle):
-    """Menggerakkan servo ke sudut tertentu dan menahan posisinya."""
-    duty = angle_to_duty_cycle(angle)
-    pwm.ChangeDutyCycle(duty)
-    time.sleep(1) # Beri waktu agar servo fisik sempat mencapai posisi target.
+    """Menggerakkan servo secara langsung ke posisi target (untuk gate servo)."""
+    duty_cycle = angle_to_duty_cycle(angle)
+    pwm.ChangeDutyCycle(duty_cycle)
+    time.sleep(0.5) # Waktu agar servo stabil
+    pwm.ChangeDutyCycle(0) # Hentikan sinyal untuk mengurangi jitter
 
-def get_sorter_position(label):
-    """Mencari posisi sudut servo berdasarkan label klasifikasi."""
-    # Membersihkan label dari confidence score, cth: "plastic (0.92)" -> "plastic"
-    cleaned_label = label.split('(')[0].strip().lower()
+def smooth_move(pwm, start_angle, target_angle):
+    """Menggerakkan servo secara perlahan dari posisi awal ke posisi target."""
+    print(f"Servo penyortir bergerak dari {start_angle}° ke {target_angle}°...")
     
-    # Mencocokkan label yang sudah bersih dengan kamus SERVO_POSITIONS
-    if "plastic" in cleaned_label or "plastik" in cleaned_label:
-        return SERVO_POSITIONS["plastic"]
-    elif "paper" in cleaned_label or "kertas" in cleaned_label:
-        return SERVO_POSITIONS["paper"]
-    elif "organic" in cleaned_label or "organik" in cleaned_label:
-        return SERVO_POSITIONS["organic"]
-    elif "others" in cleaned_label or "lainnya" in cleaned_label:
-        return SERVO_POSITIONS["others"]
-    
-    # Jika label tidak ada dalam kamus, kembalikan None
-    return None
+    step = 1 if target_angle > start_angle else -1
+        
+    for angle in range(start_angle, target_angle + step, step):
+        duty_cycle = angle_to_duty_cycle(angle)
+        pwm.ChangeDutyCycle(duty_cycle)
+        time.sleep(0.015) # Delay kecil untuk pergerakan halus
+        
+    # Beri waktu agar servo stabil di posisi target
+    time.sleep(0.5)
+    pwm.ChangeDutyCycle(0) 
+    print("Pergerakan penyortir selesai.")
+    return target_angle # Kembalikan posisi terakhir
 
-# ===================================================================
-# --- FUNGSI LOGIKA UTAMA DENGAN PENANDA TAHAPAN YANG JELAS ---
-# ===================================================================
-def handle_classification(label):
-    print(f"\n[INFO] Siklus baru dimulai untuk klasifikasi: {label}")
+def operate_gate():
+    """Mengoperasikan servo penahan untuk membuka dan menutup."""
+    print("Servo penahan membuka...")
+    move_servo(pwm_gate, 90) # Buka penahan ke 90 derajat
     
-    # --- TAHAP 1: GERAKKAN SERVO PENYORTIR (PIN 17) ---
-    print("--- TAHAP 1: Menggerakkan Servo Penyortir ---")
-    sorter_angle = get_sorter_position(label)
+    time.sleep(1) # Jeda 1 detik agar objek jatuh
     
-    if sorter_angle is None:
-        print(f"[GAGAL] Label '{label}' tidak dikenali. Siklus dibatalkan.")
-        # Pertimbangkan untuk memindahkan servo ke posisi default/netral jika label tidak dikenali
-        # move_servo(sorter_pwm, 90) 
-        return
+    print("Servo penahan menutup...")
+    move_servo(pwm_gate, 0) # Tutup kembali penahan ke 0 derajat
 
-    print(f"  -> Mengarahkan penyortir ke sudut {sorter_angle}°.")
-    move_servo(sorter_pwm, sorter_angle)
-    print("  -> Servo Penyortir sekarang diam menahan posisi.")
-
-    # --- TAHAP 2: GERAKKAN SERVO PENDORONG (PIN 27) ---
-    print("\n--- TAHAP 2: Menggerakkan Servo Pendorong ---")
-    print(f"  -> Pendorong bergerak maju ke {PUSHER_PUSH_POS}°.")
-    move_servo(pusher_pwm, PUSHER_PUSH_POS)
-    
-    time.sleep(0.5) # Jeda singkat saat pendorong di depan
-    
-    print(f"  -> Pendorong kembali ke posisi awal {PUSHER_HOME_POS}°.")
-    move_servo(pusher_pwm, PUSHER_HOME_POS)
-    
-    print("\n[INFO] Siklus pembuangan selesai.")
-# ===================================================================
-
-# --- Pengaturan MQTT ---
+# --- Fungsi Callback MQTT ---
 def on_connect(client, userdata, flags, rc):
-    print(f"[MQTT-SERVO] Terhubung ke broker dengan kode {rc}")
-    client.subscribe(MQTT_TOPIC_SUB)
-    print(f"[MQTT-SERVO] Berlangganan ke topik '{MQTT_TOPIC_SUB}'")
+    """Callback saat berhasil terhubung ke broker."""
+    if rc == 0:
+        print("Berhasil terhubung ke MQTT Broker!")
+        client.subscribe(MQTT_TOPIC)
+        print(f"Subscribe ke topik: {MQTT_TOPIC}")
+    else:
+        print(f"Gagal terhubung, kode status: {rc}")
 
 def on_message(client, userdata, msg):
-    message = msg.payload.decode().strip()
-    commands_to_ignore = ["start", "stop", "insert again"]
-    if message.lower() in commands_to_ignore:
-        return
-    handle_classification(message)
+    """Callback saat ada pesan masuk."""
+    global current_sorter_angle
+    
+    payload = msg.payload.decode("utf-8").lower()
+    print(f"\nPesan diterima: '{payload}'")
+    
+    target_angle = -1
+    
+    if payload == "plastic":
+        target_angle = 45
+    elif payload == "paper":
+        target_angle = 90
+    elif payload == "organic":
+        target_angle = 135
+    elif payload == "other":
+        target_angle = 180
+    else:
+        print("Pesan tidak dikenali. Menunggu pesan berikutnya.")
+        
+    if target_angle != -1:
+        # 1. Gerakkan servo penyortir
+        current_sorter_angle = smooth_move(pwm_sorter, current_sorter_angle, target_angle)
+        
+        # 2. Tunggu 1 detik setelah penyortir sampai
+        print("Menunggu 1 detik sebelum membuka penahan...")
+        time.sleep(1)
+        
+        # 3. Operasikan servo penahan (buka lalu tutup)
+        operate_gate()
+        
+        print("\nSiklus selesai. Siap menerima perintah berikutnya.")
 
-def cleanup():
-    print("\n[CLEANUP] Mengembalikan servo ke posisi awal...")
-    move_servo(pusher_pwm, PUSHER_HOME_POS)
-    move_servo(sorter_pwm, 90) # Kembalikan sorter ke posisi netral (90 derajat)
-    pusher_pwm.stop()
-    sorter_pwm.stop()
-    GPIO.cleanup()
-    print("[CLEANUP] Selesai.")
+# --- Fungsi Utama ---
+def main():
+    """Fungsi utama untuk menjalankan program."""
+    try:
+        setup_servos()
+        
+        client = mqtt.Client()
+        client.on_connect = on_connect
+        client.on_message = on_message
+        
+        print(f"Menghubungkan ke broker {MQTT_BROKER}...")
+        client.connect(MQTT_BROKER, MQTT_PORT, 60)
+        client.loop_forever()
+        
+    except KeyboardInterrupt:
+        print("Program dihentikan.")
+    except Exception as e:
+        print(f"Terjadi error: {e}")
+    finally:
+        # Pastikan untuk membersihkan GPIO saat program selesai
+        if pwm_sorter:
+            pwm_sorter.stop()
+        if pwm_gate:
+            pwm_gate.stop()
+        GPIO.cleanup()
+        print("GPIO dibersihkan. Selesai.")
 
-# --- Loop Utama ---
-client = mqtt.Client()
-client.on_connect = on_connect
-client.on_message = on_message
-
-try:
-    print("[SERVO] Skrip dimulai. Menghubungkan ke MQTT Broker...")
-    client.connect(MQTT_BROKER, MQTT_PORT, 60)
-    print("[SERVO] Mengatur posisi awal servo...")
-    move_servo(pusher_pwm, PUSHER_HOME_POS)
-    move_servo(sorter_pwm, 90) # Atur sorter ke posisi netral di awal
-    print("[SERVO] Skrip siap menunggu hasil klasifikasi.")
-    client.loop_forever()
-except KeyboardInterrupt:
-    print("\n[EXIT] Program servo dihentikan oleh user.")
-finally:
-    cleanup()
+if __name__ == '__main__':
+    main()

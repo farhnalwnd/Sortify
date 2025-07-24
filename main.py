@@ -1,4 +1,4 @@
-# main.py (Versi Final dengan Kontrol LED Relay)
+# main.py (Versi Final dengan Kontrol LED Relay - Tanpa Nilai Akurasi)
 import time
 import threading
 import os
@@ -6,7 +6,7 @@ import paho.mqtt.client as mqtt
 from ultralytics import YOLO
 from picamera2 import Picamera2
 import cv2
-import RPi.GPIO as GPIO # <-- Impor library GPIO
+import RPi.GPIO as GPIO
 
 # --- Konfigurasi ---
 MQTT_BROKER = "broker.emqx.io"
@@ -18,12 +18,12 @@ IMAGES_DIR = "/home/admin/caps/aiCameraDetection/images"
 os.makedirs(IMAGES_DIR, exist_ok=True)
 
 # --- Konfigurasi Hardware ---
-LED_RELAY_PIN = 26 # <-- Tentukan pin GPIO untuk relay LED strip
+LED_RELAY_PIN = 26
 
 # Inisialisasi GPIO
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(LED_RELAY_PIN, GPIO.OUT)
-GPIO.output(LED_RELAY_PIN, GPIO.LOW) # Pastikan relay mati di awal
+GPIO.output(LED_RELAY_PIN, GPIO.LOW)
 
 # Variabel Global untuk Kontrol Thread
 running = False
@@ -41,19 +41,20 @@ def control_led_timed():
     """Menyalakan LED selama 4 detik tanpa memblokir thread utama."""
     try:
         print("[LED] Menyalakan lampu...")
-        GPIO.output(LED_RELAY_PIN, GPIO.HIGH) # Nyalakan relay (LED ON)
+        GPIO.output(LED_RELAY_PIN, GPIO.HIGH)
         time.sleep(4)
     finally:
-        GPIO.output(LED_RELAY_PIN, GPIO.LOW) # Matikan relay (LED OFF)
+        GPIO.output(LED_RELAY_PIN, GPIO.LOW)
         print("[LED] Mematikan lampu.")
 
 # --- Fungsi Utama ---
 def classify_and_publish(picam2, mqtt_client):
     """
     Fungsi hybrid yang bisa menangani model deteksi (boxes) dan klasifikasi (probs).
+    Mengirim hanya label tanpa nilai akurasi.
     """
     print("[CAMERA] Persiapan mengambil gambar...")
-    time.sleep(5) # Waktu tunggu ini mungkin bisa disesuaikan/dikurangi jika LED sudah menyala
+    time.sleep(5)
     frame = picam2.capture_array()
     
     print("[YOLO] Memproses gambar...")
@@ -76,24 +77,24 @@ def classify_and_publish(picam2, mqtt_client):
         
         # --- KONDISI 1: JIKA MODEL ADALAH DETEKSI OBJEK ---
         if result.boxes and len(result.boxes) > 0:
-            print("[INFO] Model terdeteksi sebagai 'Detection Model'. Memproses 'boxes'.")
+            print("[INFO] Model terdeteksi sebagai 'Detection Model'.")
             confidences = result.boxes.conf.tolist()
             class_ids = result.boxes.cls.tolist()
             
             best_idx = confidences.index(max(confidences))
             best_label = model.names[int(class_ids[best_idx])]
-            best_conf = confidences[best_idx]
             
-            label_str = f"{best_label} ({best_conf:.2f})"
+            # Hanya kirim label tanpa confidence
+            label_str = f"{best_label}"
 
         # --- KONDISI 2: JIKA MODEL ADALAH KLASIFIKASI GAMBAR ---
         elif result.probs is not None:
-            print("[INFO] Model terdeteksi sebagai 'Classification Model'. Memproses 'probs'.")
+            print("[INFO] Model terdeteksi sebagai 'Classification Model'.")
             class_id = result.probs.top1
-            confidence = result.probs.top1conf
             label = model.names[class_id]
             
-            label_str = f"{label} ({float(confidence):.2f})"
+            # Hanya kirim label tanpa confidence
+            label_str = f"{label}"
 
     except Exception as e:
         print(f"[YOLO ERROR] Terjadi kesalahan saat memproses hasil: {e}")
@@ -102,7 +103,6 @@ def classify_and_publish(picam2, mqtt_client):
     print(f"[CLASSIFICATION] Hasil Final: {label_str}")
     mqtt_client.publish(MQTT_TOPIC, label_str)
     print(f"[MQTT-MAIN] Hasil '{label_str}' dipublikasikan ke topik '{MQTT_TOPIC}'")
-
 
 def camera_loop():
     """Loop utama untuk thread kamera yang berjalan di background."""
@@ -133,18 +133,14 @@ def on_message(client, userdata, msg):
     print(f"[MQTT-MAIN] Pesan diterima: {message}")
 
     if message == "start":
-        # Nyalakan LED di thread terpisah agar tidak memblokir
         led_thread = threading.Thread(target=control_led_timed)
         led_thread.start()
-        
         running = True
         process_command = "start"
     
     elif message == "insert again" and running:
-        # Nyalakan LED di thread terpisah agar tidak memblokir
         led_thread = threading.Thread(target=control_led_timed)
         led_thread.start()
-
         process_command = "insert again"
         
     elif message == "stop":
@@ -168,4 +164,4 @@ except KeyboardInterrupt:
     print("\n[EXIT] Program utama dihentikan oleh user.")
 finally:
     print("[CLEANUP] Program utama selesai.")
-    GPIO.cleanup() # <-- Membersihkan pin GPIO saat program keluar
+    GPIO.cleanup()
