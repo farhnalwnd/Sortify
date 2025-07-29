@@ -1,110 +1,158 @@
-import time
+# --- Impor Pustaka ---
 import paho.mqtt.client as mqtt
 import RPi.GPIO as GPIO
+import time
 
-# Konfigurasi MQTT Broker
+# --- Konfigurasi MQTT dan Sensor ---
 MQTT_BROKER = "broker.emqx.io"
-MQTT_PORT = 1883
+MQTT_LISTENER_PORT = 1883        # Port MQTT biasa untuk menerima perintah
+MQTT_PUBLISHER_PORT = 8083       # WebSocket port untuk kirim data ke web
+WEBSOCKET_PATH = "/mqtt"         # Path WebSocket standar
 
-# ==============================================================================
-# --- KONFIGURASI SENSOR (SESUAIKAN PIN & TOPIK DI SINI) ---
-# ==============================================================================
-SENSORS_CONFIG = [
-    {
-        "name": "Tong Sampah 1 (Plastic)",
-        "trig_pin": 18,  # Pin Trig sensor 1 (Tetap sesuai permintaan)
-        "echo_pin": 24,  # Pin Echo sensor 1 (Tetap sesuai permintaan)
-        "topic": "waste/bin_status/plastic"
-    },
-    {
-        "name": "Tong Sampah 2 (Paper)",
-        "trig_pin": 23,  # Ganti dengan pin Trig sensor 2
-        "echo_pin": 25,  # Ganti dengan pin Echo sensor 2
-        "topic": "waste/bin_status/paper"
-    },
-    {
-        "name": "Tong Sampah 3 (Organic)",
-        "trig_pin": 5,   # Ganti dengan pin Trig sensor 3
-        "echo_pin": 6,   # Ganti dengan pin Echo sensor 3
-        "topic": "waste/bin_status/organic"
-    },
-    {
-        "name": "Tong Sampah 4 (Others)",
-        "trig_pin": 12,  # Ganti dengan pin Trig sensor 4
-        "echo_pin": 13,  # Ganti dengan pin Echo sensor 4
-        "topic": "waste/bin_status/others"
-    }
+CONTROL_TOPIC = "waste/raw"      # Topic untuk perintah (start, stop)
+SENSORS = [
+    {'trig': 5,  'echo': 6,  'topic': 'waste/sensor2'},
+    {'trig': 13, 'echo': 19, 'topic': 'waste/sensor9'},
+    {'trig': 26, 'echo': 16, 'topic': 'waste/sensor8'},
+    {'trig': 20, 'echo': 21, 'topic': 'waste/sensor7'}
 ]
-# ==============================================================================
 
-# Inisialisasi GPIO
-GPIO.setmode(GPIO.BCM)
-for sensor in SENSORS_CONFIG:
-    GPIO.setup(sensor["trig_pin"], GPIO.OUT)
-    GPIO.setup(sensor["echo_pin"], GPIO.IN)
+TINGGI_TONG_CM = 40
+JARAK_SENSOR_DARI_BIBIR_CM = 10
 
-# Inisialisasi MQTT Client
-client = mqtt.Client()
-client.connect(MQTT_BROKER, MQTT_PORT, 60)
+# --- Variabel Global ---
+is_running = False
+stop_requested_time = None
 
-def read_distance(trig_pin, echo_pin):
-    """Membaca jarak dari satu sensor ultrasonik."""
-    # Kirim sinyal trigger
-    GPIO.output(trig_pin, False)
-    time.sleep(0.05)
-    
+# --- Setup GPIO ---
+def setup_gpio():
+    GPIO.setwarnings(False)
+    GPIO.setmode(GPIO.BCM)
+    for sensor in SENSORS:
+        GPIO.setup(sensor['trig'], GPIO.OUT)
+        GPIO.setup(sensor['echo'], GPIO.IN)
+        GPIO.output(sensor['trig'], False)
+    print("GPIO disiapkan.")
+    time.sleep(2)
+
+# --- Mengukur Jarak ---
+def measure_distance(trig_pin, echo_pin):
     GPIO.output(trig_pin, True)
     time.sleep(0.00001)
     GPIO.output(trig_pin, False)
 
-    pulse_start = time.time()
-    pulse_end = time.time()
-
-    # Tunggu sinyal echo kembali
+    timeout_start = time.time()
     while GPIO.input(echo_pin) == 0:
-        pulse_start = time.time()
+        if time.time() - timeout_start > 0.1:
+            return -1
+        pulse_start_time = time.time()
 
     while GPIO.input(echo_pin) == 1:
-        pulse_end = time.time()
+        if time.time() - timeout_start > 0.1:
+            return -1
+        pulse_end_time = time.time()
 
-    # Hitung jarak
-    pulse_duration = pulse_end - pulse_start
-    distance = pulse_duration * 17150  # Konversi ke cm
+    pulse_duration = pulse_end_time - pulse_start_time
+    distance = (pulse_duration * 34300) / 2
     return round(distance, 2)
 
-def calculate_bin_capacity(distance_cm):
-    """Menghitung persentase kapasitas tong sampah berdasarkan jarak."""
-    max_distance = 50.0  # Tinggi tong sampah (cm), sesuaikan jika perlu
-    # Pastikan jarak tidak lebih dari max_distance untuk perhitungan yang akurat
-    # dan tidak kurang dari 0
-    clamped_distance = max(0, min(distance_cm, max_distance))
-    
-    filled_percent = (1 - (clamped_distance / max_distance)) * 100
-    return round(max(0, min(100, filled_percent)), 2)
+# --- Hitung Persentase Sampah ---
+def calculate_fullness_percentage(measured_distance_cm):
+    if measured_distance_cm < 0:
+        return -1
+    full = JARAK_SENSOR_DARI_BIBIR_CM
+    empty = full + TINGGI_TONG_CM
+    if measured_distance_cm <= full:
+        return 100
+    if measured_distance_cm >= empty:
+        return 0
+    tinggi_sampah = empty - measured_distance_cm
+    return int(round((tinggi_sampah / TINGGI_TONG_CM) * 100))
 
-try:
-    print("[ULTRASONIC] Skrip dimulai. Membaca 4 sensor...")
-    while True:
-        # Loop melalui setiap sensor dalam konfigurasi
-        for sensor in SENSORS_CONFIG:
-            distance = read_distance(sensor["trig_pin"], sensor["echo_pin"])
-            capacity = calculate_bin_capacity(distance)
-            
-            print(f"[{sensor['name']}] Jarak: {distance} cm, Kapasitas: {capacity}% -> Topik: {sensor['topic']}")
-            
-            # Publikasikan ke topik MQTT yang sesuai
-            client.publish(sensor["topic"], f"{capacity}%")
-            
-            # Beri jeda singkat antar pembacaan sensor untuk stabilitas
+# --- Callback: Saat Konek ke Broker ---
+def on_connect(client, userdata, flags, rc):
+    client_id = client._client_id.decode('utf-8')
+    if rc == 0:
+        print(f"✅ Terkoneksi ke broker! (Client: {client_id})")
+        if client_id == "waste_listener_client":
+            client.subscribe(CONTROL_TOPIC)
+            print(f"📡 Mendengarkan perintah di topic '{CONTROL_TOPIC}'")
+    else:
+        print(f"❌ Gagal konek (Client: {client_id}), kode: {rc}")
+
+# --- Callback: Saat Terima Pesan ---
+def on_message(client, userdata, msg):
+    global is_running, stop_requested_time
+    command = msg.payload.decode('utf-8').lower()
+    print(f"📨 Perintah diterima: {command}")
+    if command in ["start", "insert again"]:
+        if not is_running:
+            is_running = True
+            stop_requested_time = None
+            print("▶️ Memulai pengukuran.")
+        else:
+            stop_requested_time = None
+            print("ℹ️ Pengukuran sudah berjalan.")
+    elif command == "stop":
+        if is_running and stop_requested_time is None:
+            stop_requested_time = time.time()
+            print("⏸️ Stop diminta, akan berhenti dalam 5 detik.")
+        elif not is_running:
+            print("ℹ️ Sudah dalam keadaan berhenti.")
+
+# --- MAIN PROGRAM ---
+if __name__ == "__main__":
+    listener_client = None
+    publisher_client = None
+    try:
+        setup_gpio()
+
+        # --- Listener Client (port 1883) ---
+        listener_client = mqtt.Client(client_id="waste_listener_client")
+        listener_client.on_connect = on_connect
+        listener_client.on_message = on_message
+        listener_client.connect(MQTT_BROKER, MQTT_LISTENER_PORT, 60)
+        listener_client.loop_start()
+
+        # --- Publisher Client (via WebSocket) ---
+        publisher_client = mqtt.Client(client_id="waste_publisher_client", transport="websockets")
+        publisher_client.ws_set_options(path=WEBSOCKET_PATH)
+        publisher_client.on_connect = on_connect
+        publisher_client.connect(MQTT_BROKER, MQTT_PUBLISHER_PORT, 60)
+        publisher_client.loop_start()
+
+        print("\n🚀 Sistem siap. Menunggu perintah MQTT...")
+
+        cycle_count = 0
+        while True:
+            if is_running and stop_requested_time is not None:
+                if time.time() - stop_requested_time > 5:
+                    is_running = False
+                    stop_requested_time = None
+                    cycle_count = 0
+                    print("🛑 Pengukuran dihentikan total.")
+
+            if is_running:
+                cycle_count += 1
+                print(f"\n--- Siklus #{cycle_count} ---")
+                for sensor in SENSORS:
+                    dist = measure_distance(sensor['trig'], sensor['echo'])
+                    percent = calculate_fullness_percentage(dist)
+                    if percent != -1:
+                        publisher_client.publish(sensor['topic'], str(percent))
+                        print(f"📤 {sensor['topic']} | {dist} cm → {percent}%")
+            else:
+                print("⌛ Mode siaga... menunggu perintah 'start'...", end="\r")
             time.sleep(1)
-        
-        print("--- Siklus pembacaan selesai. Menunggu 10 detik. ---")
-        # Tunggu sebelum memulai siklus pembacaan berikutnya
-        time.sleep(10)
 
-except KeyboardInterrupt:
-    print("\n[EXIT] Program dihentikan oleh user.")
-finally:
-    print("[CLEANUP] Membersihkan GPIO...")
-    GPIO.cleanup()
-    print("[CLEANUP] Selesai.")
+    except KeyboardInterrupt:
+        print("\n⛔ Program dihentikan oleh pengguna.")
+    finally:
+        GPIO.cleanup()
+        if listener_client:
+            listener_client.loop_stop()
+            listener_client.disconnect()
+        if publisher_client:
+            publisher_client.loop_stop()
+            publisher_client.disconnect()
+        print("✅ GPIO dibersihkan. Semua koneksi ditutup.")
