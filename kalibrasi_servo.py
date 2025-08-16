@@ -2,13 +2,14 @@ import RPi.GPIO as GPIO
 import time
 
 # Ganti pin ini jika Anda menggunakan pin yang berbeda
-SORTER_SERVO_PIN = 18 
+SORTER_SERVO_PIN = 17
 
 # Inisialisasi GPIO
 GPIO.setmode(GPIO.BCM)
 GPIO.setup(SORTER_SERVO_PIN, GPIO.OUT)
 pwm = GPIO.PWM(SORTER_SERVO_PIN, 50)
 pwm.start(0)
+
 
 def angle_to_duty_cycle(angle):
     return (angle / 18) + 2

@@ -2,150 +2,162 @@ import RPi.GPIO as GPIO
 import paho.mqtt.client as mqtt
 import time
 
-SORTER_SERVO_PIN = 18
-GATE_SERVO_PIN = 23
-
+# --- Pin & MQTT Configuration ---
+SORTER_SERVO_PIN = 17
+GATE_SERVO_PIN = 4
 
 MQTT_BROKER = "broker.emqx.io"
-MQTT_PORT = 1883
+MQTT_PORT = 8084
 MQTT_TOPIC = "waste/raw"
 
-
+# --- Global Variables ---
 pwm_sorter = None
 pwm_gate = None
-current_sorter_angle = 0
+current_sorter_angle = 90
 
-# --- Inisialisasi Servo ---
+# --- Servo Functions ---
 def setup_servos():
     global pwm_sorter, pwm_gate, current_sorter_angle
     
+    GPIO.setwarnings(False)
     GPIO.setmode(GPIO.BCM)
     GPIO.setup(SORTER_SERVO_PIN, GPIO.OUT)
     GPIO.setup(GATE_SERVO_PIN, GPIO.OUT)
     
-    # Frekuensi PWM 50Hz
     pwm_sorter = GPIO.PWM(SORTER_SERVO_PIN, 50)
     pwm_gate = GPIO.PWM(GATE_SERVO_PIN, 50)
     
-    pwm_sorter.start(0)
     pwm_gate.start(0)
     
-    print("Kedua servo telah diinisialisasi.")
+    print("Initializing servos...")
     
-    # Atur posisi awal saat program dimulai
-    # Servo penyortir di 0 derajat, servo penahan di posisi menutup (0 derajat)
-    move_servo(pwm_gate, 0) # Pastikan gate tertutup
+    print("Gate servo moving to standby position (100°).")
+    move_servo(pwm_gate, 100)
     time.sleep(0.5)
-    current_sorter_angle = smooth_move(pwm_sorter, current_sorter_angle, 0) # Sorter di posisi awal
-    print("Servo siap di posisi awal.")
+    
+    print("Sorter servo moving to default position (90°)...")
+    default_duty_cycle = angle_to_duty_cycle(current_sorter_angle)
+    pwm_sorter.start(default_duty_cycle)
+    time.sleep(1)
+    pwm_sorter.ChangeDutyCycle(0)
+    
+    print("\n--- System Ready ---")
 
 def angle_to_duty_cycle(angle):
-    """Mengonversi sudut (0-180) ke duty cycle (2-12)."""
     return (angle / 18) + 2
 
 def move_servo(pwm, angle):
-    """Menggerakkan servo secara langsung ke posisi target (untuk gate servo)."""
     duty_cycle = angle_to_duty_cycle(angle)
     pwm.ChangeDutyCycle(duty_cycle)
-    time.sleep(0.5) # Waktu agar servo stabil
-    pwm.ChangeDutyCycle(0) # Hentikan sinyal untuk mengurangi jitter
+    time.sleep(0.5)
+    pwm.ChangeDutyCycle(0)
 
 def smooth_move(pwm, start_angle, target_angle):
-    """Menggerakkan servo secara perlahan dari posisi awal ke posisi target."""
-    print(f"Servo penyortir bergerak dari {start_angle}° ke {target_angle}°...")
+    if start_angle == target_angle:
+        print(f"Sorter is already at {target_angle}°, no movement needed.")
+        return target_angle
+
+    print(f"Sorter moving from {start_angle}° to {target_angle}°...")
     
     step = 1 if target_angle > start_angle else -1
         
     for angle in range(start_angle, target_angle + step, step):
         duty_cycle = angle_to_duty_cycle(angle)
         pwm.ChangeDutyCycle(duty_cycle)
-        time.sleep(0.015) # Delay kecil untuk pergerakan halus
+        time.sleep(0.02)
         
-    # Beri waktu agar servo stabil di posisi target
     time.sleep(0.5)
-    pwm.ChangeDutyCycle(0) 
-    print("Pergerakan penyortir selesai.")
-    return target_angle # Kembalikan posisi terakhir
+    pwm.ChangeDutyCycle(0)
+    print(f"Sorter has reached {target_angle}°.")
+    return target_angle
 
 def operate_gate():
-    """Mengoperasikan servo penahan untuk membuka dan menutup."""
-    print("Servo penahan membuka...")
-    move_servo(pwm_gate, 90) # Buka penahan ke 90 derajat
+    print("Gate opening (moving to 0°)...")
+    move_servo(pwm_gate, 0)
     
-    time.sleep(1) # Jeda 1 detik agar objek jatuh
+    time.sleep(1)
     
-    print("Servo penahan menutup...")
-    move_servo(pwm_gate, 0) # Tutup kembali penahan ke 0 derajat
+    print("Gate closing (returning to 100°)...")
+    move_servo(pwm_gate, 100)
 
-# --- Fungsi Callback MQTT ---
+# --- MQTT Callback Functions ---
 def on_connect(client, userdata, flags, rc):
-    """Callback saat berhasil terhubung ke broker."""
     if rc == 0:
-        print("Berhasil terhubung ke MQTT Broker!")
+        print("Successfully connected to MQTT Broker!")
         client.subscribe(MQTT_TOPIC)
-        print(f"Subscribe ke topik: {MQTT_TOPIC}")
+        print(f"Subscribed to topic: {MQTT_TOPIC}")
     else:
-        print(f"Gagal terhubung, kode status: {rc}")
+        print(f"Failed to connect, status code: {rc}")
 
 def on_message(client, userdata, msg):
-    """Callback saat ada pesan masuk."""
     global current_sorter_angle
     
     payload = msg.payload.decode("utf-8").lower()
-    print(f"\nPesan diterima: '{payload}'")
+    print(f"\n>>> Message received: '{payload}'")
     
-    target_angle = -1
+    angle_map = {
+        "recycle": 70,
+        "paper": 110,
+        "organic": 30,
+        "other": 160
+    }
     
-    if payload == "plastic":
-        target_angle = 45
-    elif payload == "paper":
-        target_angle = 90
-    elif payload == "organic":
-        target_angle = 135
-    elif payload == "other":
-        target_angle = 180
-    else:
-        print("Pesan tidak dikenali. Menunggu pesan berikutnya.")
-        
+    target_angle = angle_map.get(payload, -1)
+
     if target_angle != -1:
-        # 1. Gerakkan servo penyortir
         current_sorter_angle = smooth_move(pwm_sorter, current_sorter_angle, target_angle)
         
-        # 2. Tunggu 1 detik setelah penyortir sampai
-        print("Menunggu 1 detik sebelum membuka penahan...")
+        print("Waiting 1 second before opening gate...")
         time.sleep(1)
         
-        # 3. Operasikan servo penahan (buka lalu tutup)
         operate_gate()
         
-        print("\nSiklus selesai. Siap menerima perintah berikutnya.")
+        print("Checking if return movement is needed...")
+        time.sleep(0.5)
 
-# --- Fungsi Utama ---
+        if payload == "other":
+            print("Position 'other', returning to 'paper' (100°)...")
+            target_return_angle = angle_map["paper"]
+            current_sorter_angle = smooth_move(pwm_sorter, current_sorter_angle, target_return_angle)
+
+        elif payload == "organic":
+            print("Position 'organic', returning to 'recycle' (60°)...")
+            target_return_angle = angle_map["recycle"]
+            current_sorter_angle = smooth_move(pwm_sorter, current_sorter_angle, target_return_angle)
+        
+        else:
+            print("Position 'paper' or 'recycle', staying put.")
+
+        print("\n--- Cycle Complete, Waiting for Next Message ---")
+    else:
+        print("Invalid message. Waiting for the next message.")
+
+# --- Main Function ---
 def main():
-    """Fungsi utama untuk menjalankan program."""
     try:
         setup_servos()
         
-        client = mqtt.Client()
+        client = mqtt.Client(transport="websockets")
+        client.tls_set()
+        
         client.on_connect = on_connect
         client.on_message = on_message
         
-        print(f"Menghubungkan ke broker {MQTT_BROKER}...")
+        print(f"Connecting to broker wss://{MQTT_BROKER}:{MQTT_PORT}...")
         client.connect(MQTT_BROKER, MQTT_PORT, 60)
         client.loop_forever()
         
     except KeyboardInterrupt:
-        print("Program dihentikan.")
+        print("\nProgram stopped by user.")
     except Exception as e:
-        print(f"Terjadi error: {e}")
+        print(f"An unexpected error occurred: {e}")
     finally:
-        # Pastikan untuk membersihkan GPIO saat program selesai
         if pwm_sorter:
             pwm_sorter.stop()
         if pwm_gate:
             pwm_gate.stop()
         GPIO.cleanup()
-        print("GPIO dibersihkan. Selesai.")
+        print("GPIO cleaned up. Program finished.")
 
 if __name__ == '__main__':
     main()
