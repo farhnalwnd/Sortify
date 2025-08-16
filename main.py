@@ -63,7 +63,6 @@ def classify_and_publish(picam2, mqtt_client):
         result = results[0]
         detected_label = ""
         
-        # --- KONDISI 1: JIKA MODEL ADALAH DETEKSI OBJEK ---
         if result.boxes and len(result.boxes) > 0:
             confidences = result.boxes.conf.tolist()
             class_ids = result.boxes.cls.tolist()
@@ -71,12 +70,10 @@ def classify_and_publish(picam2, mqtt_client):
             best_idx = confidences.index(max(confidences))
             detected_label = model.names[int(class_ids[best_idx])]
 
-        # --- KONDISI 2: JIKA MODEL ADALAH KLASIFIKASI GAMBAR ---
         elif result.probs is not None:
             class_id = result.probs.top1
             detected_label = model.names[class_id]
         
-        # --- PROSES PENGELOMPOKAN ---
         if detected_label:
             final_category = get_category_from_label(detected_label)
             print(f"[GROUPING] Label terdeteksi: '{detected_label}', Dikelompokkan ke: '{final_category}'")
